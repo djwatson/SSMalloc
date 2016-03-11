@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include "ssmalloc.h"
+#include "unistd.h"
+
 
 /* Global metadata */
 init_state global_state = UNINITIALIZED;
@@ -15,6 +17,8 @@ char sizemap2[128];
 /* Private metadata */
 THREAD_LOCAL init_state thread_state = UNINITIALIZED;
 THREAD_LOCAL lheap_t *local_heap = NULL;
+
+#include <stdatomic.h>
 
 /* System init functions */
 static void maps_init(void);
@@ -44,13 +48,8 @@ inline static void dchunk_collect_garbage(dchunk_t *dc);
 inline static void *dchunk_alloc_obj(dchunk_t *dc);
 inline static dchunk_t* dchunk_extract(void *ptr);
 
-/* Object buffer management functions */
-inline static void obj_buf_flush(obj_buf_t *obuf);
-inline static void obj_buf_flush_all(lheap_t *lh);
-inline static void obj_buf_put(obj_buf_t *bbuf, dchunk_t * dc, void *ptr);
-
 /* Allocator helpers */
-inline static void *large_malloc(size_t size);
+inline static void *large_malloc(size_t size, void* owner);
 inline static void *small_malloc(int size_cls);
 inline static void large_free(void *ptr);
 inline static void local_free(lheap_t *lh, dchunk_t *dc, void *ptr);
@@ -60,7 +59,7 @@ static void *large_memalign(size_t boundary, size_t size);
 /* Misc functions */
 static void* page_alloc(void *pos, size_t size);
 static void page_free(void *pos, size_t size);
-static void touch_memory_range(void *start, size_t len); 
+static void touch_memory_range(void *start, size_t len);
 inline static int size2cls(size_t size);
 
 #ifdef DEBUG
@@ -85,18 +84,33 @@ static void* gpool_gc(void* arg)
     char *ptr = NULL;
 
     /* sleeptime = 100 ms */
-    struct timespec sleeptime = {0, 10000000};
+    int slot = 0;
 
     while(1) {
-        nanosleep(&sleeptime, NULL);
-        ptr = (char*) queue_fetch(&global_pool.free_dc_head[get_core_id()]);
-        if(ptr) {
-            void *ptr_end = PAGE_ROUNDDOWN(ptr + CHUNK_SIZE);
-            void *ptr_start = PAGE_ROUNDUP(ptr);
-            madvise(ptr_start, (uintptr_t)ptr_end - (uintptr_t)ptr_start, MADV_DONTNEED); 
-            queue_put(&global_pool.released_dc_head[get_core_id()], ptr);
-        }
+	usleep(100000);
+      int i;
+      for(i = 0; i < MAX_CORE_ID; i++) {
+	ptr = (char*) queue_fetch(&global_pool.free_dc_head[i]);
+	if(ptr) {
+	  void *ptr_end = (void*)PAGE_ROUNDDOWN(ptr + CHUNK_SIZE);
+	  void *ptr_start = (void*)PAGE_ROUNDUP(ptr);
+	  madvise(ptr_start, (uintptr_t)ptr_end - (uintptr_t)ptr_start, MADV_DONTNEED);
+	  queue_put(&global_pool.released_dc_head[i], ptr);
+	}
+	do {
+	  ptr = (char*) queue_fetch(&global_pool.free_lg_head[i][slot]);
+	  if(ptr) {
+	    void *ptr_end = (void*)PAGE_ROUNDDOWN(ptr + MAX_LARGE_SIZE);
+	    void *ptr_start = (void*)PAGE_ROUNDUP(ptr);
+	    madvise(ptr_start, (uintptr_t)ptr_end - (uintptr_t)ptr_start, MADV_DONTNEED);
+	    queue_put(&global_pool.released_lg_head[i], ptr);
+	  }
+	} while(ptr);
+      }
+	slot = (slot + 1) % LARGE_SLOTS;
+
     }
+    return NULL;
 }
 #endif
 
@@ -119,7 +133,6 @@ static void maps_init()
     for (size = 128 + 32; size <= 256; size += 32, class++) {
         cls2size[class] = size;
     }
-
     for (size = 256; size < 65536; size <<= 1) {
         cls2size[class++] = size + (size >> 1);
         cls2size[class++] = size << 1;
@@ -134,7 +147,7 @@ static void maps_init()
             cur_class++;
         sizemap[(cur_size - 1) >> 2] = cur_class;
     }
-    
+
     /* init sizemap2 */
     for (cur_size = 1024; cur_size <= 65536; cur_size += 512) {
         if (cur_size > cls2size[cur_class])
@@ -164,7 +177,6 @@ static void global_init()
     /* Register the signal handler for backtrace*/
     signal(SIGSEGV, handler);
 #endif
-
     pthread_key_create(&destructor, thread_exit);
 
     /* Initialize global data */
@@ -229,6 +241,52 @@ static void gpool_init()
     //queue_init(&global_pool.free_dc_head);
     pthread_mutex_init(&global_pool.lock, NULL);
     gpool_grow();
+}
+
+inline static chunk_t *gpool_acquire_large(size_t sz)
+{
+    void *ptr = NULL;
+    int slot = sz / LARGE_IDX_CNT;
+
+    /* Try to alloc a freed chunk from the free list */
+    ptr = queue_fetch(&global_pool.free_lg_head[get_core_id()][slot]);
+    if (ptr) {
+      return (chunk_t *) ptr;
+    }
+
+    int i;
+    for(i = slot; i < LARGE_SLOTS; i++) {
+      ptr = queue_fetch(&global_pool.free_lg_head[get_core_id()][i]);
+      if (ptr) {
+	  large_header_t *header = (large_header_t*)dchunk_extract(ptr);
+	if (i > slot) {
+	  void *ptr_end = (void*)PAGE_ROUNDDOWN(ptr + (header->slot)*LARGE_IDX_CNT);
+	  void *ptr_start = (void*)PAGE_ROUNDUP(ptr + (slot*LARGE_IDX_CNT));
+	  madvise(ptr_start, (uintptr_t)ptr_end - (uintptr_t)ptr_start, MADV_DONTNEED);
+	}
+        header->slot = slot;
+	return (chunk_t *) ptr;
+      }
+    }
+    if (slot >0 ){
+      for(i = (slot-1); i >= 0; i--) {
+	ptr = queue_fetch(&global_pool.free_lg_head[get_core_id()][i]);
+	if (ptr) {
+	  large_header_t *header = (large_header_t*)dchunk_extract(ptr);
+	  header->slot = slot;
+	  return (chunk_t *) ptr;
+	}
+      }
+    }
+    ptr = queue_fetch(&global_pool.released_lg_head[get_core_id()]);
+        return (chunk_t *) ptr;
+
+}
+
+inline static void gpool_release_large(void* ptr)
+{
+    large_header_t *header = (large_header_t*)dchunk_extract(ptr);
+  queue_put(&global_pool.free_lg_head[get_core_id()][header->slot], ptr);
 }
 
 inline static chunk_t *gpool_acquire_chunk()
@@ -308,6 +366,7 @@ inline static void lheap_init(lheap_t * lh)
     }
 }
 
+
 inline static void lheap_replace_foreground
     (lheap_t * lh, int size_cls) {
     dchunk_t *dc;
@@ -326,6 +385,28 @@ inline static void lheap_replace_foreground
         goto finish;
     }
 
+    /* Try to acquire background from global pool */
+    int core = get_core_id();
+    dc = (dchunk_t *) queue_fetch(&global_pool.free_background_head[core][size_cls]);
+    if (dc == NULL) {
+      for (core = 0; core < MAX_CORE_ID; core++) {
+	    dc = (dchunk_t *) queue_fetch(&global_pool.free_background_head[core][size_cls]);
+	    if (dc != NULL) break;
+      }
+    }
+    if (dc != NULL) {
+      dc->owner = lh;
+      dc->active_link.next = NULL;
+      dc->active_link.prev = NULL;
+      if (dc->free_blk_cnt == 0)
+	dchunk_collect_garbage(dc);
+
+      if (dc->blk_cnt == dc->free_blk_cnt) {
+	// TODO release?
+      }
+      goto finish;
+    }
+
     /* Try to acquire the chunk from local pool */
     dc = (dchunk_t *) seq_queue_fetch(&lh->free_head);
     if (dc != NULL) {
@@ -338,13 +419,12 @@ inline static void lheap_replace_foreground
 
     dc = (dchunk_t *) gpool_acquire_chunk();
     dc->owner = lh;
-    fast_queue_init((FastQueue *) & (dc->remote_free_head));
     dchunk_init(dc, size_cls);
-    
+
   finish:
     /* Set the foreground chunk */
     lh->foreground[size_cls] = dc;
-    dc->state = FOREGROUND;
+    dc->state = dchunk_tag_state(FOREGROUND, dc->state);
 }
 
 inline static void dchunk_change_cls(dchunk_t * dc, int size_cls)
@@ -356,7 +436,23 @@ inline static void dchunk_change_cls(dchunk_t * dc, int size_cls)
     dc->block_size = size;
     dc->free_mem = (char *)dc + data_offset;
     dc->size_cls = size_cls;
+    dc->alloc_size = cls2size[dc->size_cls];
     seq_queue_init(&dc->free_head);
+
+    if (size_cls == DUMMY_CLASS) return;
+
+    int i = dc->blk_cnt >> 6;
+    if (dc->blk_cnt % 64 != 0) {
+      i++;
+    }
+    dc->groups = i;
+
+    memset(&dc->bitmap, 0xff, dc->groups << 3);
+    memset(&dc->remote_bitmap, 0x00, dc->groups << 3);
+    int extra = (dc->blk_cnt % (dc->groups * 64));
+    if (extra != 0) {
+      dc->bitmap[dc->groups - 1] >>= (64 - extra);
+    }
 }
 
 inline static void dchunk_init(dchunk_t * dc, int size_cls)
@@ -366,10 +462,51 @@ inline static void dchunk_init(dchunk_t * dc, int size_cls)
     dchunk_change_cls(dc, size_cls);
 }
 
+inline static void dchunk_free_bitmap(dchunk_t *dc, void* ptr);
+
+
 inline static void dchunk_collect_garbage(dchunk_t * dc)
 {
-    seq_head(dc->free_head) =
-        counted_chain_dequeue(&dc->remote_free_head, &dc->free_blk_cnt);
+  int i;
+  for (i  = 0; i < dc->groups; i++) {
+    unsigned long old = atomic_exchange(&dc->remote_bitmap[i], 0x0000000000000000);
+    dc->bitmap[i] |= old;
+    dc->free_blk_cnt += __builtin_popcountl(old);
+  }
+}
+inline static void *dchunk_alloc_bitmap(dchunk_t *dc) {
+  unsigned i = 0;
+  unsigned long g;
+  unsigned long bit;
+  g = dc->bitmap[0];
+  while((bit = __builtin_ffsl(g)) == 0) {
+    i++;
+    g = dc->bitmap[i];
+  }
+  unsigned long *gp = &dc->bitmap[i];
+  g ^= (unsigned long)0x01 << (bit - 1);
+  *gp = g;
+
+  bit = (bit - 1) + (i << 6);
+
+  return (void*)((uintptr_t)dc + (uintptr_t)DCH + bit*dc->block_size);
+}
+
+inline static void dchunk_free_bitmap(dchunk_t *dc, void* ptr) {
+  unsigned long bit = ((uintptr_t)ptr - ((uintptr_t)dc + DCH)) / dc->block_size;
+
+  unsigned goff = bit >> 6;
+  unsigned long *gp = &dc->bitmap[goff];
+  unsigned long g = *gp;
+  g ^= (unsigned long)0x01 << (bit & 0x3F);
+  *gp = g;
+}
+
+inline static void dchunk_remote_free_bitmap(dchunk_t *dc, void* ptr) {
+  unsigned long bit = ((uintptr_t)ptr - ((uintptr_t)dc + DCH)) / dc->block_size;
+
+  unsigned goff = bit >> 6;
+  atomic_fetch_add(&dc->remote_bitmap[goff], (unsigned long)0x01 << (bit & 0x3F));
 }
 
 inline static void *dchunk_alloc_obj(dchunk_t * dc)
@@ -381,6 +518,7 @@ inline static void *dchunk_alloc_obj(dchunk_t * dc)
 
     if (unlikely(!ret)) {
         ret = dc->free_mem;
+
         dc->free_mem += dc->block_size;
     } else {
         seq_head(dc->free_head) = *(void**)ret;
@@ -403,56 +541,13 @@ inline static dchunk_t *dchunk_extract(void *ptr)
     return (dchunk_t *) ((uintptr_t)ptr - ((uintptr_t)ptr % CHUNK_SIZE));
 }
 
-inline static void obj_buf_flush(obj_buf_t * bbuf)
-{
-    void *prev;
+static void try_full_to_background(unsigned int state, dchunk_t* dc);
 
-    dchunk_t *dc = bbuf->dc;
-    lheap_t *lh = dc->owner;
 
-    prev = counted_chain_enqueue(&(dc->remote_free_head),
-                                 seq_head(bbuf->free_head), bbuf->first, bbuf->count);
-    bbuf->count = 0;
-    bbuf->dc = NULL;
-    bbuf->first = NULL;
-    seq_head(bbuf->free_head) = NULL;
-
-    /* If I am the first thread done remote free in this memory chunk*/
-    if ((unsigned long long)prev == 0L) {
-        fast_queue_put(&(lh->need_gc[dc->size_cls]), dc);
-    }
-    return;
-}
-
-inline static void obj_buf_flush_all(lheap_t *lh) {
-    int i;
-    for (i = 0; i < BLOCK_BUF_CNT; i++) {
-        obj_buf_t *buf = &lh->block_bufs[i];
-        if (buf->count == 0)
-            continue;
-        obj_buf_flush(buf);
-        buf->dc = NULL;
-    }
-}
-
-inline static void obj_buf_put(obj_buf_t *bbuf, dchunk_t * dc, void *ptr) {
-    if (unlikely(bbuf->dc != dc)) {
-        if (bbuf->dc != NULL) {
-            obj_buf_flush(bbuf);
-        }
-        bbuf->dc = dc;
-        bbuf->first = ptr;
-        bbuf->count = 0;
-        seq_head(bbuf->free_head) = NULL;
-    }
-
-    seq_queue_put(&bbuf->free_head, ptr);
-    bbuf->count++;
-}
-
-inline static void *large_malloc(size_t size)
+inline static void *large_malloc(size_t size, void* owner)
 {
     size_t alloc_size = PAGE_ROUNDUP(size + CHUNK_SIZE);
+
     void *mem = page_alloc(NULL, alloc_size);
     void *mem_start = (char*)mem + CHUNK_SIZE - CACHE_LINE_SIZE;
     large_header_t *header = (large_header_t *)dchunk_extract(mem_start);
@@ -462,12 +557,12 @@ inline static void *large_malloc(size_t size)
     if (distance >= sizeof(large_header_t)) {
         header->alloc_size = alloc_size;
         header->mem = mem;
-        header->owner = LARGE_OWNER;
+	header->owner = owner;
         return mem_start;
     }
 
     /* If not, Retry Allocation */
-    void *ret = large_malloc(size);
+    void *ret = large_malloc(size, owner);
     page_free(mem, alloc_size);
     return ret;
 }
@@ -477,20 +572,31 @@ inline static void *small_malloc(int size_cls)
     lheap_t *lh = local_heap;
     dchunk_t *dc;
     void *ret;
+
+    if (likely(size_cls < MAX_CACHE_CLASS && lh->cached[size_cls] > 0)) {
+      ret = lh->cache[size_cls][LH_CACHE_SIZE - (--lh->cached[size_cls]) - 1];
+      return ret;
+    }
+
   retry:
     dc = lh->foreground[size_cls];
-    ret = dchunk_alloc_obj(dc);
+    if (dc->free_blk_cnt > 0 && dc->size_cls != DUMMY_CLASS) {
+      ret = dchunk_alloc_bitmap(dc);
+    }
 
     /* Check if the datachunk is full */
     if (unlikely(--dc->free_blk_cnt == 0)) {
-        dc->state = FULL;
-        lheap_replace_foreground(lh, size_cls);
-        if (unlikely(dc->size_cls == DUMMY_CLASS)) {
-            /* A dummy chunk */
-            dc->free_blk_cnt = 1;
-            goto retry;
-        }
-    }
+	if (unlikely(dc->free_blk_cnt == 0)) {
+	  dc->state = dchunk_tag_state(FULL, dc->state);
+	  dc->owner = NULL;
+	  lheap_replace_foreground(lh, size_cls);
+	  if (unlikely(dc->size_cls == DUMMY_CLASS)) {
+	    /* A dummy chunk */
+	    dc->free_blk_cnt = 1;
+	    goto retry;
+	  }
+	}
+      }
 
     return ret;
 }
@@ -501,22 +607,39 @@ inline static void large_free(void *ptr)
     page_free(header->mem, header->alloc_size);
 }
 
+static void try_full_to_background(unsigned int state, dchunk_t* dc) {
+  if (dchunk_get_state(state) == FULL) {
+    if (compare_and_swap32(&dc->state, state, dchunk_tag_state(BACKGROUND, state))) {
+	dc->owner = NULL;
+	queue_put(&global_pool.free_background_head[get_core_id()][dc->size_cls], dc);
+    }
+  }
+}
+
 inline static void local_free(lheap_t * lh, dchunk_t * dc, void *ptr)
 {
-    unsigned int free_blk_cnt = ++dc->free_blk_cnt;
-    seq_queue_put(&dc->free_head, ptr);
-
-    switch (dc->state) {
+  unsigned int free_blk_cnt;
+  switch (dchunk_get_state(dc->state)) {
     case FULL:
-        double_list_insert_front(dc, &lh->background[dc->size_cls]);
-        dc->state = BACKGROUND;
+      if (0 ) {
+	dc->state = dchunk_tag_state(BACKGROUND, dc->state);
+	free_blk_cnt = ++dc->free_blk_cnt;
+	seq_queue_put(&dc->free_head, ptr);
+
+	double_list_insert_front(dc, &lh->background[dc->size_cls]);
+      } else {
+	dc->owner = NULL;
+	remote_free(lh, dc, ptr);
+      }
         break;
-    case BACKGROUND:
+      case BACKGROUND:
+	seq_queue_put(&dc->free_head, ptr);
+	free_blk_cnt = ++dc->free_blk_cnt;
         if (unlikely(free_blk_cnt == dc->blk_cnt)) {
             int free_cnt = lh->free_cnt;
             double_list_remove(dc, &lh->background[dc->size_cls]);
 
-            if (free_cnt >= MAX_FREE_CHUNK) {
+            if (1 || free_cnt >= MAX_FREE_CHUNK) {
                 gpool_release_chunk(dc);
             } else {
                 seq_queue_put(&lh->free_head, dc);
@@ -525,6 +648,10 @@ inline static void local_free(lheap_t * lh, dchunk_t * dc, void *ptr)
         }
         break;
     case FOREGROUND:
+      dchunk_free_bitmap(dc, ptr);
+	free_blk_cnt = ++dc->free_blk_cnt;
+	//seq_queue_put(&dc->free_head, ptr);
+
         /* Tada.. */
         break;
     }
@@ -533,19 +660,15 @@ inline static void local_free(lheap_t * lh, dchunk_t * dc, void *ptr)
 THREAD_LOCAL int buf_cnt;
 inline static void remote_free(lheap_t * lh, dchunk_t * dc, void *ptr)
 {
-    /* Put the object in a local buffer rather than return it to owner */
-    int tag = ((unsigned long long)dc / CHUNK_SIZE) % BLOCK_BUF_CNT;
-    obj_buf_t *bbuf = &lh->block_bufs[tag];
-    obj_buf_put(bbuf, dc, ptr);
-
-    /* Periodically flush buffered remote objects */
-    if ((buf_cnt++ & 0xFFFF) == 0) {
-        obj_buf_flush_all(lh);
-    }
+  unsigned int state = dc->state;
+  dchunk_remote_free_bitmap(dc, ptr);
+	try_full_to_background(state, dc);
 }
 
 static void touch_memory_range(void *addr, size_t len)
 {
+
+
     char *ptr = (char *)addr;
     char *end = ptr + len;
 
@@ -561,11 +684,11 @@ static void *large_memalign(size_t boundary, size_t size) {
     void *mem = page_alloc(NULL, alloc_size);
 
     /* Align up the address to boundary */
-    void *mem_start = 
+    void *mem_start =
         (void*)((uintptr_t)((char*)mem + padding) & ~(boundary - 1));
 
     /* Extract space for an header */
-    large_header_t *header = 
+    large_header_t *header =
         (large_header_t *)dchunk_extract(mem_start);
 
     /* If space is enough for the header of a large block */
@@ -573,7 +696,7 @@ static void *large_memalign(size_t boundary, size_t size) {
     if (distance >= sizeof(large_header_t)) {
         header->alloc_size = alloc_size;
         header->mem = mem;
-        header->owner = LARGE_OWNER;
+        header->owner = HUGE_OWNER;
         return mem_start;
     }
 
@@ -614,7 +737,7 @@ static void *page_alloc(void *pos, size_t size)
 }
 
 static void page_free(void *pos, size_t size)
-{   
+{
     munmap(pos, size);
 }
 
@@ -651,11 +774,39 @@ void *malloc(size_t size)
     int size_cls = size2cls(size);
     if (likely(size_cls < DEFAULT_BLOCK_CLASS)) {
         ret = small_malloc(size_cls);
+    } else if (size < MAX_LARGE_SIZE) {
+      ret = gpool_acquire_large(size);
+      if (!ret) {
+	ret = large_malloc(MAX_LARGE_SIZE, LARGE_OWNER);
+	int slot = size / LARGE_IDX_CNT;
+	large_header_t *header = (large_header_t*)dchunk_extract(ret);
+	header->slot = slot;
+      }
     } else {
-        ret = large_malloc(size);
+      ret = large_malloc(size, HUGE_OWNER);
     }
     return ret;
 }
+
+size_t malloc_usable_size(void *ptr)
+{
+    if(ptr == NULL) {
+        return 0;
+    }
+
+    dchunk_t *dc = dchunk_extract(ptr);
+    lheap_t *target_lh = dc->owner;
+
+    if(likely(target_lh != HUGE_OWNER && target_lh != LARGE_OWNER)){
+      return dc->alloc_size;
+    } else if (target_lh == HUGE_OWNER) {
+	large_header_t *header = (large_header_t*)dchunk_extract(ptr);
+	return header->alloc_size;
+    } else {
+	return MAX_LARGE_SIZE;
+    }
+}
+
 
 void free(void *ptr)
 {
@@ -663,17 +814,26 @@ void free(void *ptr)
         return;
     }
 
+    check_init();
     dchunk_t *dc = dchunk_extract(ptr);
     lheap_t *lh = local_heap;
     lheap_t *target_lh = dc->owner;
-
     if (likely(target_lh == lh)) {
+      if (likely(dc->size_cls < MAX_CACHE_CLASS && lh->cached[dc->size_cls] < LH_CACHE_SIZE)) {
+	lh->cache[dc->size_cls][LH_CACHE_SIZE - (lh->cached[dc->size_cls]++) - 1] = ptr;
+      } else {
         local_free(lh, dc, ptr);
-    } else if(likely(target_lh != LARGE_OWNER)){
-        check_init();
+      }
+    } else if(likely(target_lh != HUGE_OWNER && target_lh != LARGE_OWNER)){
         lh = local_heap;
+      if (likely(dc->size_cls < MAX_CACHE_CLASS && lh->cached[dc->size_cls] < LH_CACHE_SIZE)) {
+	lh->cache[dc->size_cls][LH_CACHE_SIZE - (lh->cached[dc->size_cls]++) - 1] = ptr;
+      } else {
         remote_free(lh, dc, ptr);
-    } else {
+      }
+    } else if (target_lh == LARGE_OWNER) {
+      gpool_release_large(ptr);
+    } else if (target_lh == HUGE_OWNER) {
         large_free(ptr);
     }
 }
@@ -691,7 +851,7 @@ void *realloc(void* ptr, size_t size)
     }
 
     dchunk_t *dc = dchunk_extract(ptr);
-    if (dc->owner != LARGE_OWNER) {
+    if (dc->owner != HUGE_OWNER && dc->owner != LARGE_OWNER) {
         int old_size = cls2size[dc->size_cls];
 
         /* Not exceed the current size, return */
@@ -715,7 +875,7 @@ void *realloc(void* ptr, size_t size)
         if(size <= old_size) {
             return ptr;
         }
-        
+
         /* Try to do mremap */
         int new_size = PAGE_ROUNDUP(size + CHUNK_SIZE);
         mem = mremap(mem, alloc_size, new_size, MREMAP_MAYMOVE);
@@ -730,10 +890,10 @@ void *realloc(void* ptr, size_t size)
             return mem_start;
         }
 
-        void* new_ptr = large_malloc(size);
+        void* new_ptr = large_malloc(size, HUGE_OWNER);
         memcpy(new_ptr, mem_start, old_size);
-        free(mem);
-        return new_ptr; 
+        free(ptr);
+        return new_ptr;
     }
 }
 

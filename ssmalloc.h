@@ -12,6 +12,7 @@
 #include <assert.h>
 #include <execinfo.h>
 #include <signal.h>
+#include <stdatomic.h>
 
 #include "atomic.h"
 #include "bitops.h"
@@ -23,10 +24,16 @@
 #define CHUNK_DATA_SIZE     (16*PAGE_SIZE)
 #define ALLOC_UNIT          (4*1024*1024)
 #define MAX_FREE_SIZE       (4*1024*1024)
-#define RAW_POOL_START      ((void*)((0x600000000000/CHUNK_SIZE+1)*CHUNK_SIZE))
+#define MAX_LARGE_SIZE       (CHUNK_SIZE*30 - sizeof(large_header_t))
+#define LARGE_IDX_CNT       (8*PAGE_SIZE)
+#define LARGE_SLOTS	(MAX_LARGE_SIZE/LARGE_IDX_CNT)
+#define RAW_POOL_START      ((void*)((0x500000000000/CHUNK_SIZE+1)*CHUNK_SIZE))
 #define BLOCK_BUF_CNT       (16)
 
-// #define RETURN_MEMORY
+#define LH_CACHE_SIZE 150
+#define MAX_CACHE_CLASS 25
+
+#define RETURN_MEMORY
 // #define DEBUG
 
 /* Other */
@@ -37,6 +44,7 @@
 #define DCH                 (sizeof(dchunk_t))
 #define MAX_FREE_CHUNK      (MAX_FREE_SIZE/CHUNK_SIZE)
 #define LARGE_OWNER         ((void*)0xDEAD)
+#define HUGE_OWNER         ((void*)0xDEDE)
 #define ACTIVE              ((void*)1)
 
 /* Utility Macros */
@@ -104,6 +112,7 @@ typedef double_list_elem_t LinkedListElem;
 
 struct large_header_s {
     CACHE_ALIGN size_t alloc_size;
+    size_t slot;
     void* mem;
     CACHE_ALIGN lheap_t *owner;
 };
@@ -112,6 +121,15 @@ struct chunk_s {
     CACHE_ALIGN LinkedListElem active_link;
     uint32_t numa_node;
 };
+
+#define STATE_MASK 0x000000FF
+unsigned int dchunk_get_state(unsigned int state) {
+  return state & STATE_MASK;
+}
+#define STATE_BIT 0x00000100
+unsigned int dchunk_tag_state(unsigned int state, unsigned int old_state) {
+  return state | ((old_state & ~STATE_MASK) + STATE_BIT);
+}
 
 /* Data chunk header */
 struct dchunk_s {
@@ -122,17 +140,20 @@ struct dchunk_s {
     /* Read Area */
     CACHE_ALIGN lheap_t * owner;
     uint32_t size_cls;
+    size_t alloc_size;
 
     /* Local Write Area */
-     CACHE_ALIGN dchunk_state state;
+     CACHE_ALIGN unsigned int state;
     uint32_t free_blk_cnt;
     uint32_t blk_cnt;
     SeqQueue free_head;
     uint32_t block_size;
     char *free_mem;
+    unsigned long bitmap[128];
+    int groups;
 
     /* Remote Write Area */
-     CACHE_ALIGN FastQueue remote_free_head;
+    CACHE_ALIGN atomic_ulong remote_bitmap[128];
 };
 
 struct gpool_s {
@@ -141,15 +162,11 @@ struct gpool_s {
     volatile char *pool_end;
     volatile char *free_start;
     Queue free_dc_head[MAX_CORE_ID];
+    Queue free_lg_head[MAX_CORE_ID][LARGE_SLOTS];
     Queue free_lh_head[MAX_CORE_ID];
+    Queue released_lg_head[MAX_CORE_ID];
     Queue released_dc_head[MAX_CORE_ID];
-};
-
-struct obj_buf_s {
-    void *dc;
-    void *first;
-    SeqQueue free_head;
-    int count;
+  Queue free_background_head[MAX_CORE_ID][DEFAULT_BLOCK_CLASS];
 };
 
 /* Per-thread data chunk pool */
@@ -160,9 +177,10 @@ struct lheap_s {
     uint32_t free_cnt;
 
     dchunk_t *foreground[DEFAULT_BLOCK_CLASS];
+  void *cache[MAX_CACHE_CLASS][LH_CACHE_SIZE];
+  unsigned char cached[MAX_CACHE_CLASS];
     LinkedList background[DEFAULT_BLOCK_CLASS];
     dchunk_t dummy_chunk;
-    obj_buf_t block_bufs[BLOCK_BUF_CNT];
 
      CACHE_ALIGN FastQueue need_gc[DEFAULT_BLOCK_CLASS];
 };
